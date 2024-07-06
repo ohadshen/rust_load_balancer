@@ -1,65 +1,84 @@
 use axum::async_trait;
 use std::sync::{Arc, Mutex};
 
+use crate::utils::time_utils::get_current_time;
+
 use super::traits::IRateLimiter;
 
 static MAX_WINDOW_REQUESTS: i32 = 10;
-static WINDOW_DURATION: u64 = 10;
+static WINDOW_DURATION: i64 = 10;
 
 pub struct FixedWindowRateLimiter {
     current_requests: Arc<Mutex<i32>>,
+    last_refill_time: Arc<Mutex<i64>>,
 }
 
 #[async_trait]
 impl IRateLimiter for FixedWindowRateLimiter {
     async fn validate(&self) -> bool {
-        let requests_value = *self.current_requests.lock().unwrap();
+        if self.should_refill_window() {
+            self.perform_window_refill();
+        }
+
+        let requests_value = self.get_requests();
 
         if requests_value < MAX_WINDOW_REQUESTS {
             self.set_requests(requests_value + 1);
-            return true;
+            true
         } else {
-            return false;
+            false
         }
     }
 
     async fn limiter_status(&self) -> String {
-        let requests_value = *self.current_requests.lock().unwrap();
-        format!("Requests: {}", requests_value)
+        let current_time = get_current_time();
+        let last_refill_time = *self.last_refill_time.lock().unwrap();
+        let time_since_last_refill = current_time - last_refill_time;
+
+        format!(
+            "Requests: {}, Of: {}, Time since last refill: {}",
+            self.get_requests(),
+            MAX_WINDOW_REQUESTS,
+            time_since_last_refill
+        )
     }
 }
 
 impl FixedWindowRateLimiter {
     pub fn new() -> Self {
-        let requests = Arc::new(Mutex::new(0));
-        let requests_clone = Arc::clone(&requests);
-
-        tokio::spawn(async move {
-            Self::move_to_next_window(requests_clone).await;
-        });
+        let current_requests = Arc::new(Mutex::new(0));
+        let last_refill_time = Arc::new(Mutex::new(get_current_time()));
 
         FixedWindowRateLimiter {
-            current_requests: requests,
-        }
-    }
-
-    async fn move_to_next_window(requests: Arc<Mutex<i32>>) {
-        loop {
-            let duration = tokio::time::Duration::from_secs(WINDOW_DURATION);
-            tokio::time::sleep(duration).await;
-
-            let mut requests_locked = requests.lock().unwrap();
-
-            println!("window passed, request limit: {}", MAX_WINDOW_REQUESTS);
-            if *requests_locked < MAX_WINDOW_REQUESTS {
-                *requests_locked = MAX_WINDOW_REQUESTS;
-            }
+            current_requests,
+            last_refill_time,
         }
     }
 
     pub fn set_requests(&self, value: i32) {
         let mut requests = self.current_requests.lock().unwrap();
-        println!("set requests from {} to {}", *requests, value);
         *requests = value;
+    }
+
+    fn should_refill_window(&self) -> bool {
+        let current_time = get_current_time();
+        let time_since_last_refill = current_time - *self.last_refill_time.lock().unwrap();
+        time_since_last_refill >= WINDOW_DURATION
+    }
+
+    fn perform_window_refill(&self) {
+        let current_time = get_current_time();
+
+        *self.current_requests.lock().unwrap() = 0;
+        *self.last_refill_time.lock().unwrap() = current_time;
+
+        println!(
+            "Window reset. Requests reset to 0. Last refill time updated to {}.",
+            current_time
+        );
+    }
+
+    fn get_requests(&self) -> i32 {
+        *self.current_requests.lock().unwrap()
     }
 }
