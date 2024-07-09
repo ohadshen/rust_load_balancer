@@ -1,5 +1,5 @@
 pub mod fixed_window;
-pub mod leaking_bucket;
+pub mod leaky_bucket;
 pub mod sliding_window;
 pub mod token_bucket;
 pub mod traits;

@@ -1,118 +1,155 @@
 use axum::async_trait;
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
 
 use crate::utils::time_utils::get_current_time;
 
 use super::traits::IRateLimiter;
 
-static MAX_WINDOW_REQUESTS: i32 = 10;
-static WINDOW_DURATION: i64 = 10;
+static WINDOW_SIZE: i64 = 10;
 
-pub struct SlidingWindowRateLimiter {
-    current_requests: Arc<Mutex<i32>>,
-    last_requests: Arc<Mutex<i32>>,
-    window_start_time: Arc<Mutex<i64>>,
+struct SlidingWindowLimiterByIpModel {
+    current_requests: i64,
+    last_requests: i64,
+    last_refill_time: i64,
+}
+
+impl SlidingWindowLimiterByIpModel {
+    fn clone(&self) -> Self {
+        SlidingWindowLimiterByIpModel {
+            current_requests: self.current_requests,
+            last_requests: self.last_requests,
+            last_refill_time: self.last_refill_time,
+        }
+    }
+
+    pub fn new() -> Self {
+        SlidingWindowLimiterByIpModel {
+            current_requests: 0,
+            last_requests: 0,
+            last_refill_time: get_current_time(),
+        }
+    }
+}
+
+struct SlidingWindowLimiterModel {
+    map_by_ip: HashMap<String, SlidingWindowLimiterByIpModel>,
+}
+
+impl SlidingWindowLimiterModel {
+    pub fn new() -> Self {
+        SlidingWindowLimiterModel {
+            map_by_ip: HashMap::new(),
+        }
+    }
+
+    pub fn get_value(&self, ip: &String) -> &SlidingWindowLimiterByIpModel {
+        self.map_by_ip.get(ip).unwrap()
+    }
+
+    fn add_request(&mut self, ip: &String) {
+        let mut value = self.map_by_ip.get(ip).unwrap().clone();
+        value.current_requests += 1;
+        self.map_by_ip.insert(ip.clone(), value);
+    }
+
+    fn set_requests(&mut self, ip: &String, requests_to_set: i64) {
+        let mut value = self.map_by_ip.get(ip).unwrap().clone();
+
+        value.current_requests = requests_to_set;
+        self.map_by_ip.insert(ip.clone(), value);
+    }
+
+    fn set_last_requests(&mut self, ip: &String, last_requests_to_set: i64) {
+        let mut value = self.map_by_ip.get(ip).unwrap().clone();
+        value.last_requests = last_requests_to_set;
+        self.map_by_ip.insert(ip.clone(), value);
+    }
+
+    pub fn set_last_refill_time(&mut self, ip: String, last_refill_time: i64) {
+        let mut value = self.map_by_ip.get(&ip).unwrap().clone();
+
+        value.last_refill_time = last_refill_time;
+        self.map_by_ip.insert(ip, value);
+    }
+}
+
+pub struct SlidingWindowLimiter {
+    limiter_model: SlidingWindowLimiterModel,
 }
 
 #[async_trait]
-impl IRateLimiter for SlidingWindowRateLimiter {
-    async fn validate(&self) -> bool {
-        if self.should_refill_window() {
-            self.perform_window_refill();
-        }
+impl IRateLimiter for SlidingWindowLimiter {
+    async fn validate(&mut self, ip: &String) -> bool {
+        self.init_ip_in_map_if_needed(&ip);
 
-        let requests_in_sliding_window = self.calculate_requests_in_sliding_window();
+        self.move_window_if_needed(&ip);
 
-        let current_requests = *self.current_requests.lock().unwrap();
+        let requests_in_sliding_window = self.calculate_requests_in_sliding_window(ip);
 
-        if requests_in_sliding_window < MAX_WINDOW_REQUESTS {
-            // Update current requests count
-            self.set_requests(current_requests + 1);
+        if requests_in_sliding_window < WINDOW_SIZE {
+            self.limiter_model.add_request(&ip);
             true
         } else {
             false
         }
     }
 
-    async fn limiter_status(&self) -> String {
-        let window_start_time = *self.window_start_time.lock().unwrap();
-        let current_time = get_current_time();
-        let time_in_current_window = current_time - window_start_time;
-
-        // Calculate requests in the sliding window based on given formula for status
-        let requests_in_sliding_window = self.calculate_requests_in_sliding_window();
-
-        // print all struct values and requests in sliding window
+    async fn limiter_status(&self, ip: &String) -> String {
+        let requests_value = self.limiter_model.get_value(ip).current_requests;
+        let last_requests_value = self.limiter_model.get_value(ip).last_requests;
+        let window_start_time = self.limiter_model.get_value(ip).last_refill_time;
         format!(
-            "Requests: {}, Last Requests: {}, Time in Current Window: {}, Requests in Sliding Window: {}",
-            *self.current_requests.lock().unwrap(),
-            *self.last_requests.lock().unwrap(),
-            time_in_current_window,
-            requests_in_sliding_window
+            "ip: {}, Requests: {}, Last Requests: {}, Window Start Time: {}",
+            ip, requests_value, last_requests_value, window_start_time
         )
     }
 }
 
-impl SlidingWindowRateLimiter {
-    pub fn new() -> Self {
-        let current_requests = Arc::new(Mutex::new(0));
-        let last_requests = Arc::new(Mutex::new(0));
-        let window_start_time = Arc::new(Mutex::new(get_current_time()));
-
-        SlidingWindowRateLimiter {
-            current_requests,
-            last_requests,
-            window_start_time,
-        }
-    }
-
-    pub fn set_requests(&self, value: i32) {
-        let mut requests = self.current_requests.lock().unwrap();
-        *requests = value;
-    }
-
-    fn should_refill_window(&self) -> bool {
-        let current_time = get_current_time();
-        let time_since_last_refill = current_time - *self.window_start_time.lock().unwrap();
-        time_since_last_refill >= WINDOW_DURATION
-    }
-
-    fn perform_window_refill(&self) {
-        let mut window_start_time_locked = self.window_start_time.lock().unwrap();
-
-        let current_time = get_current_time();
-
-        let time_since_last_refill = current_time - *window_start_time_locked;
-        let mut current_requests_locked = self.current_requests.lock().unwrap();
-        let mut last_requests_locked = self.last_requests.lock().unwrap();
-
-        if time_since_last_refill >= 2 * WINDOW_DURATION {
-            *last_requests_locked = 0;
-        } else {
-            *last_requests_locked = *current_requests_locked;
-        }
-
-        *current_requests_locked = 0;
-        let window_delta_to_reduce = time_since_last_refill % WINDOW_DURATION;
-        *window_start_time_locked = current_time - window_delta_to_reduce;
-
-        println!(
-            "Window reset. Requests reset to 0. Last refill time updated to {}.",
-            *window_start_time_locked
-        );
-    }
-
-    fn calculate_requests_in_sliding_window(&self) -> i32 {
-        let current_requests = *self.current_requests.lock().unwrap();
-        let last_requests = *self.last_requests.lock().unwrap();
-        let window_start_time = *self.window_start_time.lock().unwrap();
+impl SlidingWindowLimiter {
+    fn calculate_requests_in_sliding_window(&self, ip: &String) -> i64 {
+        let current_requests = self.limiter_model.get_value(ip).current_requests;
+        let last_requests = self.limiter_model.get_value(ip).last_requests;
+        let window_start_time = self.limiter_model.get_value(ip).last_refill_time;
         let current_time = get_current_time();
 
         let time_in_current_window = current_time - window_start_time;
 
         let last_window_time_percentage =
-            (WINDOW_DURATION as f64 - time_in_current_window as f64) / WINDOW_DURATION as f64;
+            (WINDOW_SIZE as f64 - time_in_current_window as f64) / WINDOW_SIZE as f64;
 
-        (last_window_time_percentage * last_requests as f64 + current_requests as f64) as i32
+        (last_window_time_percentage * last_requests as f64 + current_requests as f64) as i64
+    }
+
+    fn init_ip_in_map_if_needed(&mut self, ip: &String) -> () {
+        if (self.limiter_model.map_by_ip.get(ip).is_none()) {
+            println!("Inserting new ip: {}", ip);
+            self.limiter_model
+                .map_by_ip
+                .insert(ip.clone(), SlidingWindowLimiterByIpModel::new());
+        }
+    }
+
+    fn move_window_if_needed(&mut self, ip: &String) -> () {
+        let current_time: i64 = get_current_time();
+        let current_values = self.limiter_model.get_value(ip);
+
+        let time_since_last_refill = current_time - current_values.last_refill_time;
+        let windows_passed = time_since_last_refill / WINDOW_SIZE;
+
+        if windows_passed > 0 {
+            self.limiter_model
+                .set_last_requests(&ip, current_values.current_requests);
+            self.limiter_model.set_requests(&ip, 0);
+
+            let refill_unused_delta = time_since_last_refill % WINDOW_SIZE;
+            self.limiter_model
+                .set_last_refill_time(ip.clone(), current_time - refill_unused_delta);
+        }
+    }
+
+    pub fn new() -> Self {
+        SlidingWindowLimiter {
+            limiter_model: SlidingWindowLimiterModel::new(),
+        }
     }
 }

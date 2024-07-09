@@ -9,6 +9,6 @@ pub async fn await_5_seconds() {
 
 pub fn get_current_time() -> i64 {
     let now = Utc::now();
-    let seconds = now.timestamp();
+    let seconds = now.timestamp() as i64;
     seconds
 }
